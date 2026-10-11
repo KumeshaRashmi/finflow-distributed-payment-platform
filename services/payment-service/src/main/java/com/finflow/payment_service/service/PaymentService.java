@@ -1,9 +1,15 @@
 package com.finflow.payment_service.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.finflow.payment_service.dto.CreatePaymentRequest;
 import com.finflow.payment_service.dto.PaymentResponse;
 import com.finflow.payment_service.entity.Payment;
+import com.finflow.payment_service.outbox.OutboxEvent;
+import com.finflow.payment_service.outbox.OutboxEventRepository;
+import com.finflow.payment_service.outbox.PaymentRequestedEvent;
 import com.finflow.payment_service.repository.PaymentRepository;
+
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -16,9 +22,16 @@ import java.util.UUID;
 public class PaymentService {
 
     private final PaymentRepository paymentRepository;
+    private final OutboxEventRepository outboxRepository;
+    private final ObjectMapper objectMapper;
 
-    public PaymentService(PaymentRepository paymentRepository) {
+    public PaymentService(
+            PaymentRepository paymentRepository,
+            OutboxEventRepository outboxRepository,
+            ObjectMapper objectMapper) {
         this.paymentRepository = paymentRepository;
+        this.outboxRepository = outboxRepository;
+        this.objectMapper = objectMapper;
     }
 
     @Transactional
@@ -32,7 +45,6 @@ public class PaymentService {
             );
         }
 
-        // Return the existing payment when a request is retried.
         var existing = paymentRepository.findByIdempotencyKey(
                 request.idempotencyKey()
         );
@@ -57,6 +69,7 @@ public class PaymentService {
                 );
             }
 
+            // A retry returns the existing payment; it creates no new event.
             return toResponse(payment);
         }
 
@@ -81,16 +94,43 @@ public class PaymentService {
 
         Payment savedPayment = paymentRepository.save(payment);
 
+        String eventId = UUID.randomUUID().toString();
+
+        PaymentRequestedEvent event = new PaymentRequestedEvent(
+                eventId,
+                "PAYMENT_REQUESTED",
+                savedPayment.getId().toString(),
+                savedPayment.getPaymentReference(),
+                savedPayment.getSourceAccountId(),
+                savedPayment.getDestinationAccountId(),
+                savedPayment.getAmount().toPlainString(),
+                savedPayment.getCurrency()
+        );
+
+        try {
+            String payload = objectMapper.writeValueAsString(event);
+
+            outboxRepository.save(new OutboxEvent(
+                    eventId,
+                    savedPayment.getId().toString(),
+                    "PAYMENT_REQUESTED",
+                    payload
+            ));
+        } catch (JsonProcessingException ex) {
+            // Throwing causes the payment transaction to roll back too.
+            throw new IllegalStateException(
+                    "Could not serialize payment event", ex
+            );
+        }
+
         return toResponse(savedPayment);
     }
 
     @Transactional(readOnly = true)
     public PaymentResponse getPayment(Long id) {
-
         Payment payment = paymentRepository.findById(id)
                 .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.NOT_FOUND,
-                        "Payment not found"
+                        HttpStatus.NOT_FOUND, "Payment not found"
                 ));
 
         return toResponse(payment);
